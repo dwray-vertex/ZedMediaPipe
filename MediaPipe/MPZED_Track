@@ -1,0 +1,190 @@
+import argparse
+import sys
+import time
+ 
+import numpy as np
+ 
+ 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--resolution", default="HD1080",
+                    choices=["HD2K", "HD1080", "HD720", "VGA"],
+                    help="ZED capture resolution (default: HD720, good balance for real-time)")
+    p.add_argument("--fps", type=int, default=30, help="Requested ZED camera FPS")
+    p.add_argument("--max-hands", type=int, default=2, help="Max hands for MediaPipe to track")
+    p.add_argument("--min-detection-confidence", type=float, default=0.5)
+    p.add_argument("--min-tracking-confidence", type=float, default=0.5)
+    p.add_argument("--no-display", action="store_false",
+                    help="Run headless (no cv2.imshow window) -- useful for a quick smoke test over SSH")
+    p.add_argument("--max-frames", type=int, default=None,
+                    help="Stop after N frames (useful for headless smoke test)")
+    return p.parse_args()
+ 
+ 
+def main():
+    args = parse_args()
+ 
+    # --- Import check: do these two stacks import cleanly together? ---
+    try:
+        import pyzed.sl as sl
+    except ImportError as e:
+        print(f"[FATAL] Could not import pyzed.sl -- is the ZED Python API installed "
+              f"for this interpreter? ({e})")
+        sys.exit(1)
+ 
+    try:
+        import cv2
+        print(f"[info] OpenCV version: {cv2.__version__}")
+    except ImportError as e:
+        print(f"[FATAL] Could not import cv2 ({e})")
+        sys.exit(1)
+ 
+    try:
+        import mediapipe as mp
+        print(f"[info] MediaPipe version: {mp.__version__}")
+    except ImportError as e:
+        print(f"[FATAL] Could not import mediapipe -- pip install mediapipe first. ({e})")
+        sys.exit(1)
+ 
+    # --- ZED init ---
+    res_map = {
+        "HD2K": sl.RESOLUTION.HD2K,
+        "HD1080": sl.RESOLUTION.HD1080,
+        "HD720": sl.RESOLUTION.HD720,
+        "VGA": sl.RESOLUTION.VGA,
+    }
+ 
+    init_params = sl.InitParameters()
+    init_params.camera_resolution = res_map[args.resolution]
+    init_params.camera_fps = args.fps
+    init_params.depth_mode = sl.DEPTH_MODE.NEURAL  # good default on 5.x; swap to PERFORMANCE for more headroom
+    init_params.coordinate_units = sl.UNIT.METER
+ 
+    zed = sl.Camera()
+    status = zed.open(init_params)
+    if status != sl.ERROR_CODE.SUCCESS:
+        print(f"[FATAL] ZED open failed: {status}")
+        sys.exit(1)
+ 
+    cam_info = zed.get_camera_information()
+    print(f"[info] Opened ZED: {cam_info.camera_model}, "
+          f"resolution={cam_info.camera_configuration.resolution.width}x"
+          f"{cam_info.camera_configuration.resolution.height}, "
+          f"fps={cam_info.camera_configuration.fps}")
+ 
+    runtime_params = sl.RuntimeParameters()
+    image_zed = sl.Mat()
+    depth_zed = sl.Mat()
+ 
+    # --- MediaPipe init ---
+    mp_hands = mp.solutions.hands
+    mp_drawing = mp.solutions.drawing_utils
+    mp_styles = mp.solutions.drawing_styles
+ 
+    # static_image_mode False means video capture
+    hands = mp_hands.Hands(
+        static_image_mode=False,
+        max_num_hands=args.max_hands,
+        min_detection_confidence=args.min_detection_confidence,
+        min_tracking_confidence=args.min_tracking_confidence,
+    )
+ 
+    # Landmark points on hand
+    landmarks_of_interest = {
+        0: "WRIST",
+        4: "THUMB_TIP",
+        8: "INDEX_TIP",
+        12: "MIDDLE_TIP",
+        16: "RING_TIP",
+        20: "PINKY_TIP",
+    }
+ 
+    frame_count = 0
+    t_window_start = time.time()
+    window_name = "ZED + MediaPipe Hands (test)"
+ 
+    print("[info] Starting capture loop. Press 'q' in the display window to quit "
+          "(or Ctrl+C if running headless).")
+ 
+    try:
+        while True:
+            if args.max_frames is not None and frame_count >= args.max_frames:
+                break
+ 
+            grab_status = zed.grab(runtime_params)
+            if grab_status != sl.ERROR_CODE.SUCCESS:
+                continue
+ 
+            zed.retrieve_image(image_zed, sl.VIEW.LEFT)
+            zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
+ 
+            # ZED (BGRA) --> MediaPipe (RGB)
+            frame_bgra = image_zed.get_data()
+            frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            depth_np = depth_zed.get_data()  # float32, meters, same H,W as image
+ 
+            results = hands.process(frame_rgb)
+ 
+            display_frame = frame_bgr.copy() if not args.no_display else None
+ 
+            if results.multi_hand_landmarks:
+                h, w = frame_bgr.shape[:2]
+                for hand_landmarks, handedness in zip(
+                    results.multi_hand_landmarks, results.multi_handedness
+                ):
+                    # Get Left of Right hand label 
+                    label = handedness.classification[0].label
+ 
+                    if display_frame is not None:
+                        mp_drawing.draw_landmarks(
+                            display_frame,
+                            hand_landmarks,
+                            mp_hands.HAND_CONNECTIONS,
+                            mp_styles.get_default_hand_landmarks_style(),
+                            mp_styles.get_default_hand_connections_style(),
+                        )
+ 
+                    # Depth sanity check at landmarks
+                    readings = []
+                    for idx, name in landmarks_of_interest.items():
+                        lm = hand_landmarks.landmark[idx]
+                        px, py = int(lm.x * w), int(lm.y * h)
+                        if 0 <= px < w and 0 <= py < h:
+                            z = depth_np[py, px]
+                            z_str = f"{z:.3f}m" if np.isfinite(z) and z > 0 else "invalid"
+                        else:
+                            z_str = "out of bounds"
+                        readings.append(f"{name}={z_str}")
+ 
+                    if frame_count % 30 == 0:
+                        print(f"[{label} hand] " + ", ".join(readings))
+ 
+            frame_count += 1
+            if frame_count % 30 == 0:
+                elapsed = time.time() - t_window_start
+                fps = 30 / elapsed if elapsed > 0 else 0.0
+                print(f"[perf] ~{fps:.1f} fps over last 30 frames")
+                t_window_start = time.time()
+ 
+            # Quit with q
+            if display_frame is not None:
+                cv2.imshow(window_name, display_frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+ 
+    except KeyboardInterrupt:
+        print("\n[info] Interrupted by user.")
+ 
+    finally:
+        hands.close()
+        zed.close()
+        if not args.no_display:
+            cv2.destroyAllWindows()
+        print(f"[info] Done. Processed {frame_count} frames.")
+ 
+ 
+if __name__ == "__main__":
+    main()
+ 
+
