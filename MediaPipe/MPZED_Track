@@ -1,190 +1,2572 @@
 import argparse
+import json
 import sys
 import time
- 
+import threading
+from dataclasses import dataclass
+from typing import Optional, List, Tuple
+
 import numpy as np
- 
- 
+import pyzed.sl as sl
+import cv2
+import mediapipe as mp
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--resolution", default="HD1080",
-                    choices=["HD2K", "HD1080", "HD720", "VGA"],
-                    help="ZED capture resolution (default: HD720, good balance for real-time)")
-    p.add_argument("--fps", type=int, default=30, help="Requested ZED camera FPS")
-    p.add_argument("--max-hands", type=int, default=2, help="Max hands for MediaPipe to track")
-    p.add_argument("--min-detection-confidence", type=float, default=0.5)
-    p.add_argument("--min-tracking-confidence", type=float, default=0.5)
-    p.add_argument("--no-display", action="store_false",
-                    help="Run headless (no cv2.imshow window) -- useful for a quick smoke test over SSH")
-    p.add_argument("--max-frames", type=int, default=None,
-                    help="Stop after N frames (useful for headless smoke test)")
+
+    p.add_argument(
+        "--calib",
+        default="/home/user/Documents/Ultraleap_ChArUco_Python_Calibration/camera_calibration.json",
+        help="Path to calibration JSON"
+    )
+
+    p.add_argument(
+        "--resolution",
+        default="HD1080",
+        choices=["HD2K", "HD1080", "HD720", "VGA"],
+    )
+
+    p.add_argument(
+        "--fps",
+        type=int,
+        default=30
+    )
+
+    p.add_argument(
+        "--max-hands",
+        type=int,
+        default=2
+    )
+
+    p.add_argument(
+        "--min-detection-confidence",
+        type=float,
+        default=0.5
+    )
+
+    p.add_argument(
+        "--min-tracking-confidence",
+        type=float,
+        default=0.5
+    )
+
+    p.add_argument(
+        "--detect-width",
+        type=int,
+        default=480,
+        help="Width fed to MediaPipe. 0 = native camera width."
+    )
+
+    p.add_argument(
+        "--model-complexity",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="MediaPipe model complexity. 0 is faster, 1 is accurate"
+    )
+
+    p.add_argument(
+        "--max-sync-skew-ms",
+        type=float,
+        default=50.0,
+        help="Maximum timestamp difference allowed between camera observations."
+    )
+
+    p.add_argument(
+        "--mono-refine-blend",
+        type=float,
+        default=0.65,
+        help=(
+            "How strongly mono-camera observations correct "
+            "the main ZED point. 0=none, 1=full correction."
+        )
+    )
+
+    p.add_argument(
+        "--reproj-error-threshold-px",
+        type=float,
+        default=12.0,
+        help=(
+            "Reject a camera observation when leave-one-out "
+            "reprojection error exceeds this."
+        )
+    )
+
+    p.add_argument(
+        "--reproj-error-warn-px",
+        type=float,
+        default=15.0
+    )
+
+    p.add_argument(
+        "--min-triangulation-angle-deg",
+        type=float,
+        default=2.0,
+        help="Reject very weak camera-ray geometry below this angle."
+    )
+
+    p.add_argument(
+        "--no-display",
+        action="store_true"
+    )
+
+    p.add_argument(
+        "--max-frames",
+        type=int,
+        default=None
+    )
+
     return p.parse_args()
- 
- 
+
+
+@dataclass
+class CameraCalib:
+    serial_number: int
+    name: str
+    R: np.ndarray
+    T: np.ndarray
+    fx: Optional[float] = None
+    fy: Optional[float] = None
+    cx: Optional[float] = None
+    cy: Optional[float] = None
+
+    @property
+    def center_main(self) -> np.ndarray:
+        return self.T.reshape(3).copy()
+
+
+def load_calibration(path: str):
+    with open(path, "r") as f:
+        raw = json.load(f)
+
+    calibs = {}
+
+    for name, cam in raw["cameras"].items():
+
+        transform = np.asarray(
+            cam["transform_camera_to_main"],
+            dtype=np.float64
+        )
+
+        R = transform[:3, :3]
+        T = transform[:3, 3].reshape(3, 1)
+
+        calibs[cam["serial"]] = CameraCalib(
+            serial_number=cam["serial"],
+            name=name,
+            R=R,
+            T=T
+        )
+
+    return calibs
+
+
+def correct_handedness(raw_label: str, calib_name: str) -> str:
+    """
+    The MAIN camera's MediaPipe handedness is mirrored relative to the
+    physical hand. Keep the existing correction only for MAIN.
+
+    Mono cameras retain MediaPipe's label.
+    """
+    if calib_name == "main":
+        return "Right" if raw_label == "Left" else "Left"
+
+    return raw_label
+
+
+def build_projection_matrix(calib: CameraCalib) -> np.ndarray:
+    """
+    Build P = K[R|t] mapping a point in MAIN coordinates to camera pixels.
+
+    Calibration stores:
+
+        p_main =
+            R_camera_to_main @ p_camera
+            + T_camera_to_main
+
+    Therefore:
+
+        p_camera =
+            R.T @ (p_main - T)
+    """
+
+    K = np.array(
+        [
+            [calib.fx, 0.0, calib.cx],
+            [0.0, calib.fy, calib.cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    R_main_to_cam = calib.R.T
+    T_main_to_cam = -R_main_to_cam @ calib.T
+
+    return K @ np.hstack([
+        R_main_to_cam,
+        T_main_to_cam
+    ])
+
+
+def camera_center_from_projection(
+    P: np.ndarray
+) -> np.ndarray:
+
+    _, _, Vt = np.linalg.svd(P)
+
+    c = Vt[-1]
+
+    if abs(c[3]) < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+
+    c /= c[3]
+
+    return c[:3]
+
+
+def triangulation_angle_deg(
+    point3d: np.ndarray,
+    centers: List[np.ndarray],
+) -> float:
+
+    if len(centers) < 2:
+        return 0.0
+
+    rays = []
+
+    for c in centers:
+
+        v = point3d - c
+
+        n = np.linalg.norm(v)
+
+        if n < 1e-9:
+            continue
+
+        rays.append(v / n)
+
+    if len(rays) < 2:
+        return 0.0
+
+    best = 180.0
+
+    for i in range(len(rays)):
+
+        for j in range(i + 1, len(rays)):
+
+            dot = float(
+                np.clip(
+                    np.dot(rays[i], rays[j]),
+                    -1.0,
+                    1.0
+                )
+            )
+
+            angle = np.degrees(
+                np.arccos(dot)
+            )
+
+            best = min(
+                best,
+                angle
+            )
+
+    return float(best)
+
+
+def triangulate_point(
+    observations: List[
+        Tuple[np.ndarray, float, float, int]
+    ]
+) -> Optional[np.ndarray]:
+
+    """
+    Linear DLT triangulation.
+
+    Each observation is:
+
+        (P, pixel_x, pixel_y, serial_number)
+    """
+
+    if len(observations) < 2:
+        return None
+
+    A = []
+
+    for P, px, py, _ in observations:
+
+        A.append(
+            px * P[2, :] - P[0, :]
+        )
+
+        A.append(
+            py * P[2, :] - P[1, :]
+        )
+
+    A = np.asarray(
+        A,
+        dtype=np.float64
+    )
+
+    try:
+
+        _, _, Vt = np.linalg.svd(A)
+
+    except np.linalg.LinAlgError:
+
+        return None
+
+    X = Vt[-1]
+
+    if abs(X[3]) < 1e-10:
+        return None
+
+    point = X[:3] / X[3]
+
+    if not np.all(
+        np.isfinite(point)
+    ):
+        return None
+
+    return point
+
+
+def project_point(
+    P: np.ndarray,
+    point3d: np.ndarray
+):
+
+    p = P @ np.append(
+        point3d,
+        1.0
+    )
+
+    if abs(p[2]) < 1e-10:
+        return None
+
+    return p[:2] / p[2]
+
+
+def reprojection_error_px(
+    P: np.ndarray,
+    px: float,
+    py: float,
+    point3d: np.ndarray
+) -> float:
+
+    projected = project_point(
+        P,
+        point3d
+    )
+
+    if projected is None:
+        return float("inf")
+
+    return float(
+        np.hypot(
+            projected[0] - px,
+            projected[1] - py
+        )
+    )
+
+
+def pixel_to_main_ray(
+    calib: CameraCalib,
+    px: float,
+    py: float
+) -> Tuple[np.ndarray, np.ndarray]:
+
+    """
+    Convert a camera pixel into a calibrated viewing ray expressed
+    in MAIN coordinates.
+    """
+
+    pixel = np.array(
+        [
+            px,
+            py,
+            1.0
+        ],
+        dtype=np.float64
+    )
+
+    K = np.array(
+        [
+            [calib.fx, 0.0, calib.cx],
+            [0.0, calib.fy, calib.cy],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+    try:
+
+        direction_camera = np.linalg.solve(
+            K,
+            pixel
+        )
+
+    except np.linalg.LinAlgError:
+
+        return (
+            calib.center_main.copy(),
+            np.array(
+                [0.0, 0.0, 1.0],
+                dtype=np.float64
+            )
+        )
+
+    direction_main = (
+        calib.R @ direction_camera
+    )
+
+    norm = np.linalg.norm(
+        direction_main
+    )
+
+    if norm < 1e-9:
+
+        return (
+            calib.center_main.copy(),
+            np.array(
+                [0.0, 0.0, 1.0],
+                dtype=np.float64
+            )
+        )
+
+    direction_main /= norm
+
+    return (
+        calib.center_main.copy(),
+        direction_main
+    )
+
+
+def project_point_onto_ray(
+    point_main: np.ndarray,
+    ray_origin_main: np.ndarray,
+    ray_direction_main: np.ndarray
+) -> np.ndarray:
+
+    direction = ray_direction_main
+
+    denom = float(
+        np.dot(
+            direction,
+            direction
+        )
+    )
+
+    if denom < 1e-12:
+        return point_main.copy()
+
+    t = float(
+        np.dot(
+            point_main - ray_origin_main,
+            direction
+        ) / denom
+    )
+
+    t = max(
+        0.0,
+        t
+    )
+
+    return (
+        ray_origin_main
+        + t * direction
+    )
+
+
+def refine_point_with_mono_views(
+    point_main: np.ndarray,
+    mono_observations,
+    blend: float = 0.65
+) -> Tuple[np.ndarray, float, int]:
+
+    """
+    Keep ZED XYZ as the primary point.
+
+    Mono observations provide calibrated viewing rays. The existing ZED
+    point is projected onto those rays, and the resulting correction is
+    blended into the ZED point.
+
+    MediaPipe relative Z is never used.
+    """
+
+    if (
+        point_main is None
+        or not mono_observations
+    ):
+        return (
+            point_main,
+            0.0,
+            0
+        )
+
+    blend = float(
+        np.clip(
+            blend,
+            0.0,
+            1.0
+        )
+    )
+
+    candidates = []
+    correction_distances = []
+
+    for observation in mono_observations:
+
+        calib = observation["calib"]
+
+        px = observation["px"]
+        py = observation["py"]
+
+        try:
+
+            ray_origin, ray_direction = (
+                pixel_to_main_ray(
+                    calib,
+                    px,
+                    py
+                )
+            )
+
+            projected = (
+                project_point_onto_ray(
+                    point_main,
+                    ray_origin,
+                    ray_direction
+                )
+            )
+
+        except Exception:
+            continue
+
+        if not np.all(
+            np.isfinite(projected)
+        ):
+            continue
+
+        distance = float(
+            np.linalg.norm(
+                projected - point_main
+            )
+        )
+
+        candidates.append(
+            projected
+        )
+
+        correction_distances.append(
+            distance
+        )
+
+    if not candidates:
+
+        return (
+            point_main,
+            0.0,
+            0
+        )
+
+    target = np.mean(
+        np.asarray(
+            candidates
+        ),
+        axis=0
+    )
+
+    refined = (
+        (1.0 - blend) * point_main
+        + blend * target
+    )
+
+    avg_correction = float(
+        np.mean(
+            correction_distances
+        )
+    )
+
+    return (
+        refined,
+        avg_correction,
+        len(candidates)
+    )
+
+
+def get_zed_xyz_point(
+    lm,
+    detection: dict
+) -> Optional[np.ndarray]:
+
+    """
+    Get a metric 3D point directly from ZED's XYZ measurement.
+
+    ZED is configured with UNIT.METER, so the returned point is meters.
+
+    This is the PRIMARY 3D source.
+
+    MediaPipe's landmark.z is NEVER used.
+    """
+
+    xyz = detection.get("xyz")
+
+    if xyz is None:
+        return None
+
+    if not isinstance(xyz, np.ndarray):
+        xyz = np.asarray(
+            xyz,
+            dtype=np.float32
+        )
+
+    if xyz.ndim != 3:
+        return None
+
+    h_xyz, w_xyz = xyz.shape[:2]
+
+    w = int(
+        detection["w"]
+    )
+
+    h = int(
+        detection["h"]
+    )
+
+    if (
+        w <= 0
+        or h <= 0
+        or w_xyz <= 0
+        or h_xyz <= 0
+    ):
+        return None
+
+    px = float(lm.x) * w
+    py = float(lm.y) * h
+
+    if not (
+        np.isfinite(px)
+        and np.isfinite(py)
+    ):
+        return None
+
+    # The retrieved XYZ map corresponds to the retrieved left image.
+    ix = int(
+        round(
+            px * w_xyz / float(w)
+        )
+    )
+
+    iy = int(
+        round(
+            py * h_xyz / float(h)
+        )
+    )
+
+    ix = int(
+        np.clip(
+            ix,
+            0,
+            w_xyz - 1
+        )
+    )
+
+    iy = int(
+        np.clip(
+            iy,
+            0,
+            h_xyz - 1
+        )
+    )
+
+    # -------------------------------------------------------------
+    # First try the exact landmark pixel.
+    # -------------------------------------------------------------
+
+    point = xyz[iy, ix, :3]
+
+    if (
+        np.all(np.isfinite(point))
+        and np.linalg.norm(point) > 1e-6
+    ):
+        point_camera = np.asarray(
+            point,
+            dtype=np.float64
+        )
+
+        point_main = (
+            detection["calib"].R
+            @ point_camera
+            + detection["calib"].T.reshape(3)
+        )
+
+        if np.all(
+            np.isfinite(point_main)
+        ):
+            return point_main
+
+    # -------------------------------------------------------------
+    # Fingertips and hand edges can land on invalid stereo pixels.
+    # Search a small neighborhood.
+    # -------------------------------------------------------------
+
+    radius = 3
+
+    valid_points = []
+
+    x0 = max(
+        0,
+        ix - radius
+    )
+
+    x1 = min(
+        w_xyz,
+        ix + radius + 1
+    )
+
+    y0 = max(
+        0,
+        iy - radius
+    )
+
+    y1 = min(
+        h_xyz,
+        iy + radius + 1
+    )
+
+    patch = xyz[
+        y0:y1,
+        x0:x1,
+        :3
+    ]
+
+    flat = patch.reshape(
+        -1,
+        3
+    )
+
+    for p in flat:
+
+        if not np.all(
+            np.isfinite(p)
+        ):
+            continue
+
+        if np.linalg.norm(p) <= 1e-6:
+            continue
+
+        valid_points.append(
+            p
+        )
+
+    if not valid_points:
+        return None
+
+    point_camera = np.median(
+        np.asarray(
+            valid_points,
+            dtype=np.float64
+        ),
+        axis=0
+    )
+
+    point_main = (
+        detection["calib"].R
+        @ point_camera
+        + detection["calib"].T.reshape(3)
+    )
+
+    if not np.all(
+        np.isfinite(point_main)
+    ):
+        return None
+
+    return point_main
+
+
+def observation_quality(
+    lm,
+    x: float,
+    y: float,
+    width: int,
+    height: int,
+) -> float:
+
+    if not (
+        np.isfinite(x)
+        and np.isfinite(y)
+    ):
+        return 0.0
+
+    if (
+        x < 0
+        or y < 0
+        or x >= width
+        or y >= height
+    ):
+        return 0.0
+
+    visibility = float(
+        getattr(
+            lm,
+            "visibility",
+            1.0
+        )
+    )
+
+    presence = float(
+        getattr(
+            lm,
+            "presence",
+            1.0
+        )
+    )
+
+    return (
+        max(
+            0.0,
+            min(
+                1.0,
+                visibility
+            )
+        )
+        *
+        max(
+            0.0,
+            min(
+                1.0,
+                presence
+            )
+        )
+    )
+
+
+def fuse_landmark(
+    observations,
+    min_angle_deg: float,
+    reproj_threshold_px: float
+):
+
+    """
+    Multi-view fallback.
+
+    This is ONLY used when the MAIN ZED camera cannot provide a valid
+    XYZ point for the landmark.
+
+    Requires at least two camera observations.
+
+    MediaPipe relative Z is never used.
+    """
+
+    if len(observations) < 2:
+
+        return (
+            None,
+            [],
+            "insufficient_views"
+        )
+
+    active = list(
+        observations
+    )
+
+    while len(active) >= 3:
+
+        worst_idx = None
+        worst_error = -1.0
+
+        for i, candidate in enumerate(
+            active
+        ):
+
+            others = (
+                active[:i]
+                + active[i + 1:]
+            )
+
+            point = triangulate_point(
+                others
+            )
+
+            if point is None:
+                continue
+
+            err = reprojection_error_px(
+                candidate[0],
+                candidate[1],
+                candidate[2],
+                point
+            )
+
+            if err > worst_error:
+
+                worst_error = err
+                worst_idx = i
+
+        if (
+            worst_idx is None
+            or worst_error <= reproj_threshold_px
+        ):
+            break
+
+        active.pop(
+            worst_idx
+        )
+
+    if len(active) < 2:
+
+        return (
+            None,
+            [],
+            "no_consistent_pair"
+        )
+
+    point = triangulate_point(
+        active
+    )
+
+    if point is None:
+
+        return (
+            None,
+            [],
+            "triangulation_failed"
+        )
+
+    if not np.all(
+        np.isfinite(point)
+    ):
+
+        return (
+            None,
+            [],
+            "invalid_point"
+        )
+
+    centers = [
+        camera_center_from_projection(
+            obs[0]
+        )
+        for obs in active
+    ]
+
+    angle = triangulation_angle_deg(
+        point,
+        centers
+    )
+
+    if angle < min_angle_deg:
+
+        return (
+            None,
+            [],
+            f"weak_geometry_{angle:.2f}deg"
+        )
+
+    errors = [
+        (
+            obs[3],
+            reprojection_error_px(
+                obs[0],
+                obs[1],
+                obs[2],
+                point
+            )
+        )
+        for obs in active
+    ]
+
+    return (
+        point,
+        errors,
+        "triangulated"
+    )
+
+
+LANDMARK_NAMES = [
+    "WRIST",
+    "THUMB_CMC",
+    "THUMB_MCP",
+    "THUMB_IP",
+    "THUMB_TIP",
+    "INDEX_MCP",
+    "INDEX_PIP",
+    "INDEX_DIP",
+    "INDEX_TIP",
+    "MIDDLE_MCP",
+    "MIDDLE_PIP",
+    "MIDDLE_DIP",
+    "MIDDLE_TIP",
+    "RING_MCP",
+    "RING_PIP",
+    "RING_DIP",
+    "RING_TIP",
+    "PINKY_MCP",
+    "PINKY_PIP",
+    "PINKY_DIP",
+    "PINKY_TIP"
+]
+
+
+FINGER_GROUPS = {
+    "wrist": [0],
+    "thumb": [1, 2, 3, 4],
+    "index": [5, 6, 7, 8],
+    "middle": [9, 10, 11, 12],
+    "ring": [13, 14, 15, 16],
+    "pinky": [17, 18, 19, 20]
+}
+
+
+class CameraWorker:
+
+    """
+    Each camera has two threads:
+
+      Capture thread:
+          captures the newest camera frame and, for MAIN,
+          retrieves ZED XYZ.
+
+      MediaPipe thread:
+          always consumes the newest captured frame.
+
+    No MediaPipe backlog is allowed to accumulate.
+    """
+
+    def __init__(
+        self,
+        zed_sl,
+        cv2_module,
+        mp_hands_module,
+        serial_number,
+        calib,
+        resolution,
+        fps,
+        max_hands,
+        min_det_conf,
+        min_track_conf,
+        detect_width,
+        model_complexity
+    ):
+
+        self.sl = zed_sl
+        self.cv2 = cv2_module
+        self.mp_hands_module = mp_hands_module
+
+        self.serial_number = serial_number
+        self.calib = calib
+
+        self.detect_width = detect_width
+
+        self.is_main = (
+            calib.name == "main"
+        )
+
+        # ---------------------------------------------------------
+        # Initialize the correct ZED camera type.
+        # ---------------------------------------------------------
+
+        if self.is_main:
+
+            init_params = (
+                self.sl.InitParameters()
+            )
+
+        else:
+
+            init_params = (
+                self.sl.InitParametersOne()
+            )
+
+        init_params.camera_resolution = (
+            resolution
+        )
+
+        init_params.camera_fps = (
+            fps
+        )
+
+        init_params.coordinate_units = (
+            self.sl.UNIT.METER
+        )
+
+        init_params.input.set_from_serial_number(
+            serial_number
+        )
+
+        # ---------------------------------------------------------
+        # MAIN camera:
+        #
+        # ZED metric 3D is ALWAYS enabled.
+        # No command-line flag is needed.
+        # ---------------------------------------------------------
+
+        if self.is_main:
+
+            init_params.depth_mode = (
+                self.sl.DEPTH_MODE.NEURAL
+            )
+
+        self.cam = (
+            self.sl.Camera()
+            if self.is_main
+            else self.sl.CameraOne()
+        )
+
+        status = self.cam.open(
+            init_params
+        )
+
+        if status != (
+            self.sl.ERROR_CODE.SUCCESS
+        ):
+
+            raise RuntimeError(
+                f"Failed to open camera "
+                f"SN={serial_number} "
+                f"({calib.name}): "
+                f"{status}"
+            )
+
+        # ---------------------------------------------------------
+        # Read camera intrinsics.
+        # ---------------------------------------------------------
+
+        calib_params = (
+            self.cam
+            .get_camera_information()
+            .camera_configuration
+            .calibration_parameters
+        )
+
+        if self.is_main:
+
+            left_cam = (
+                calib_params.left_cam
+            )
+
+            calib.fx = left_cam.fx
+            calib.fy = left_cam.fy
+            calib.cx = left_cam.cx
+            calib.cy = left_cam.cy
+
+        else:
+
+            calib.fx = calib_params.fx
+            calib.fy = calib_params.fy
+            calib.cx = calib_params.cx
+            calib.cy = calib_params.cy
+
+        # ---------------------------------------------------------
+        # MAIN camera uses RuntimeParameters.
+        #
+        # CameraOne uses its own grab() path.
+        # ---------------------------------------------------------
+
+        self.runtime_params = (
+            self.sl.RuntimeParameters()
+            if self.is_main
+            else None
+        )
+
+        self.image_mat = (
+            self.sl.Mat()
+        )
+
+        # ZED XYZ point cloud.
+        #
+        # This is allocated ONLY for MAIN because the mono cameras
+        # do not provide stereo depth.
+        self.xyz_mat = (
+            self.sl.Mat()
+            if self.is_main
+            else None
+        )
+
+        self.hands = (
+            self.mp_hands_module.Hands(
+                static_image_mode=False,
+                max_num_hands=max_hands,
+                min_detection_confidence=min_det_conf,
+                min_tracking_confidence=min_track_conf,
+                model_complexity=model_complexity
+            )
+        )
+
+        self._frame_lock = (
+            threading.Lock()
+        )
+
+        self._result_lock = (
+            threading.Lock()
+        )
+
+        self._latest_frame = None
+
+        self._latest_result = {
+            "frame_bgr": None,
+            "xyz": None,
+            "results": None,
+            "frame_w": None,
+            "frame_h": None,
+            "capture_ts": 0.0,
+            "processed_ts": 0.0,
+            "frame_id": -1
+        }
+
+        self._new_frame = (
+            threading.Event()
+        )
+
+        self._stop_flag = (
+            threading.Event()
+        )
+
+        self._capture_thread = (
+            threading.Thread(
+                target=self._capture_loop,
+                name=f"ZED-Capture-{serial_number}",
+                daemon=True
+            )
+        )
+
+        self._tracking_thread = (
+            threading.Thread(
+                target=self._tracking_loop,
+                name=f"MediaPipe-{serial_number}",
+                daemon=True
+            )
+        )
+
+        self.capture_fps = 0.0
+        self.tracking_fps = 0.0
+
+        self._capture_count = 0
+        self._capture_start = (
+            time.monotonic()
+        )
+
+        self._tracking_count = 0
+        self._tracking_start = (
+            time.monotonic()
+        )
+
+        self.frame_id = 0
+
+    def start(self):
+
+        self._capture_thread.start()
+        self._tracking_thread.start()
+
+    def _capture_loop(self):
+
+        cv2 = self.cv2
+
+        while not self._stop_flag.is_set():
+
+            # -----------------------------------------------------
+            # Every camera must grab a new frame before retrieval.
+            # -----------------------------------------------------
+
+            try:
+
+                if self.is_main:
+
+                    status = self.cam.grab(
+                        self.runtime_params
+                    )
+
+                else:
+
+                    # CameraOne acquisition.
+                    status = self.cam.grab()
+
+            except Exception as e:
+
+                print(
+                    f"[CAPTURE ERROR] "
+                    f"SN={self.serial_number} "
+                    f"({self.calib.name}): "
+                    f"{e}"
+                )
+
+                time.sleep(0.01)
+
+                continue
+
+            if status != (
+                self.sl.ERROR_CODE.SUCCESS
+            ):
+
+                continue
+
+            # -----------------------------------------------------
+            # Retrieve image.
+            # -----------------------------------------------------
+
+            try:
+
+                if self.is_main:
+
+                    image_status = (
+                        self.cam.retrieve_image(
+                            self.image_mat,
+                            self.sl.VIEW.LEFT
+                        )
+                    )
+
+                else:
+
+                    image_status = (
+                        self.cam.retrieve_image(
+                            self.image_mat
+                        )
+                    )
+
+            except Exception as e:
+
+                print(
+                    f"[IMAGE ERROR] "
+                    f"SN={self.serial_number} "
+                    f"({self.calib.name}): "
+                    f"{e}"
+                )
+
+                continue
+
+            if image_status not in (
+                None,
+                self.sl.ERROR_CODE.SUCCESS
+            ):
+
+                continue
+
+            frame_bgra = (
+                self.image_mat.get_data()
+            )
+
+            if frame_bgra is None:
+                continue
+
+            if frame_bgra.ndim != 3:
+                continue
+
+            # ZED images normally arrive as BGRA.
+            if frame_bgra.shape[2] == 4:
+
+                frame_bgr = cv2.cvtColor(
+                    frame_bgra,
+                    cv2.COLOR_BGRA2BGR
+                )
+
+            elif frame_bgra.shape[2] == 3:
+
+                frame_bgr = frame_bgra.copy()
+
+            else:
+
+                continue
+
+            h, w = (
+                frame_bgr.shape[:2]
+            )
+
+            xyz = None
+
+            # -----------------------------------------------------
+            # MAIN ZED:
+            #
+            # Retrieve actual XYZ point cloud.
+            #
+            # This is our metric depth source.
+            # -----------------------------------------------------
+
+            if (
+                self.is_main
+                and self.xyz_mat is not None
+            ):
+
+                try:
+
+                    xyz_status = (
+                        self.cam.retrieve_measure(
+                            self.xyz_mat,
+                            self.sl.MEASURE.XYZ
+                        )
+                    )
+
+                    if xyz_status in (
+                        None,
+                        self.sl.ERROR_CODE.SUCCESS
+                    ):
+
+                        xyz_data = (
+                            self.xyz_mat.get_data()
+                        )
+
+                        if (
+                            xyz_data is not None
+                            and xyz_data.ndim == 3
+                            and xyz_data.shape[2] >= 3
+                        ):
+
+                            xyz = (
+                                np.asarray(
+                                    xyz_data[
+                                        ...,
+                                        :3
+                                    ],
+                                    dtype=np.float32
+                                ).copy()
+                            )
+
+                except Exception as e:
+
+                    print(
+                        f"[ZED XYZ ERROR] "
+                        f"SN={self.serial_number}: "
+                        f"{e}"
+                    )
+
+                    xyz = None
+
+            capture_ts = (
+                time.monotonic()
+            )
+
+            frame_copy = (
+                frame_bgr.copy()
+            )
+
+            with self._frame_lock:
+
+                self._latest_frame = {
+                    "frame_bgr": frame_copy,
+                    "xyz": xyz,
+                    "frame_w": w,
+                    "frame_h": h,
+                    "capture_ts": capture_ts,
+                    "frame_id": self.frame_id
+                }
+
+                self.frame_id += 1
+
+            self._new_frame.set()
+
+            self._capture_count += 1
+
+            if self._capture_count >= 30:
+
+                elapsed = (
+                    time.monotonic()
+                    - self._capture_start
+                )
+
+                self.capture_fps = (
+                    self._capture_count / elapsed
+                    if elapsed > 0
+                    else 0.0
+                )
+
+                self._capture_count = 0
+
+                self._capture_start = (
+                    time.monotonic()
+                )
+
+    def _tracking_loop(self):
+
+        cv2 = self.cv2
+
+        try:
+
+            while not self._stop_flag.is_set():
+
+                self._new_frame.wait(
+                    timeout=0.05
+                )
+
+                if self._stop_flag.is_set():
+                    break
+
+                with self._frame_lock:
+
+                    frame_data = (
+                        self._latest_frame
+                    )
+
+                    self._new_frame.clear()
+
+                if frame_data is None:
+                    continue
+
+                frame_bgr = (
+                    frame_data["frame_bgr"]
+                )
+
+                h, w = (
+                    frame_bgr.shape[:2]
+                )
+
+                if (
+                    self.detect_width
+                    and w > self.detect_width
+                ):
+
+                    scale = (
+                        self.detect_width
+                        / float(w)
+                    )
+
+                    small = cv2.resize(
+                        frame_bgr,
+                        (
+                            self.detect_width,
+                            int(h * scale)
+                        )
+                    )
+
+                else:
+
+                    small = frame_bgr
+
+                small_rgb = (
+                    cv2.cvtColor(
+                        small,
+                        cv2.COLOR_BGR2RGB
+                    )
+                )
+
+                results = (
+                    self.hands.process(
+                        small_rgb
+                    )
+                )
+
+                with self._result_lock:
+
+                    self._latest_result = {
+                        "frame_bgr": frame_bgr,
+                        "xyz": frame_data["xyz"],
+                        "results": results,
+                        "frame_w": w,
+                        "frame_h": h,
+                        "capture_ts": frame_data["capture_ts"],
+                        "processed_ts": time.monotonic(),
+                        "frame_id": frame_data["frame_id"]
+                    }
+
+                self._tracking_count += 1
+
+                if self._tracking_count >= 30:
+
+                    elapsed = (
+                        time.monotonic()
+                        - self._tracking_start
+                    )
+
+                    self.tracking_fps = (
+                        self._tracking_count / elapsed
+                        if elapsed > 0
+                        else 0.0
+                    )
+
+                    self._tracking_count = 0
+
+                    self._tracking_start = (
+                        time.monotonic()
+                    )
+
+        except Exception as e:
+
+            import traceback
+
+            print(
+                f"[MediaPipe ERROR] "
+                f"SN={self.serial_number} "
+                f"({self.calib.name}): "
+                f"{e}"
+            )
+
+            traceback.print_exc()
+
+    def get_latest_frame(self):
+
+        with self._frame_lock:
+
+            if self._latest_frame is None:
+                return None
+
+            return dict(
+                self._latest_frame
+            )
+
+    def get_latest(self):
+
+        with self._result_lock:
+
+            return dict(
+                self._latest_result
+            )
+
+    def stop(self):
+
+        self._stop_flag.set()
+        self._new_frame.set()
+
+    def join(self, timeout=None):
+
+        self._capture_thread.join(
+            timeout=timeout
+        )
+
+        self._tracking_thread.join(
+            timeout=timeout
+        )
+
+    def close(self):
+
+        try:
+            self.hands.close()
+        except Exception:
+            pass
+
+        try:
+            self.cam.close()
+        except Exception:
+            pass
+
+
+def build_finger_dict(
+    points3d,
+    landmark_sources=None
+):
+
+    if points3d is None:
+        return None
+
+    out = {}
+
+    for finger, indices in FINGER_GROUPS.items():
+
+        finger_points = []
+
+        for i in indices:
+
+            point = points3d[i]
+
+            if point is None:
+
+                finger_points.append(
+                    None
+                )
+
+                continue
+
+            entry = {
+                "xyz": [
+                    round(
+                        float(point[0]),
+                        4
+                    ),
+                    round(
+                        float(point[1]),
+                        4
+                    ),
+                    round(
+                        float(point[2]),
+                        4
+                    )
+                ]
+            }
+
+            if landmark_sources is not None:
+
+                entry["source"] = (
+                    landmark_sources[i]
+                )
+
+            finger_points.append(
+                entry
+            )
+
+        out[finger] = finger_points
+
+    return out
+
+
+def send_message(payload: dict) -> None:
+    # Replace with your transport when ready.
+    pass
+
+
 def main():
+
     args = parse_args()
- 
-    # --- Import check: do these two stacks import cleanly together? ---
-    try:
-        import pyzed.sl as sl
-    except ImportError as e:
-        print(f"[FATAL] Could not import pyzed.sl -- is the ZED Python API installed "
-              f"for this interpreter? ({e})")
+
+    calibs = load_calibration(
+        args.calib
+    )
+
+    main_serials = [
+        sn
+        for sn, c in calibs.items()
+        if c.name == "main"
+    ]
+
+    if len(main_serials) != 1:
+
+        print(
+            "[FATAL] Expected exactly one "
+            "camera named 'main', "
+            f"found {len(main_serials)}."
+        )
+
         sys.exit(1)
- 
-    try:
-        import cv2
-        print(f"[info] OpenCV version: {cv2.__version__}")
-    except ImportError as e:
-        print(f"[FATAL] Could not import cv2 ({e})")
-        sys.exit(1)
- 
-    try:
-        import mediapipe as mp
-        print(f"[info] MediaPipe version: {mp.__version__}")
-    except ImportError as e:
-        print(f"[FATAL] Could not import mediapipe -- pip install mediapipe first. ({e})")
-        sys.exit(1)
- 
-    # --- ZED init ---
+
+    main_sn = (
+        main_serials[0]
+    )
+
     res_map = {
         "HD2K": sl.RESOLUTION.HD2K,
         "HD1080": sl.RESOLUTION.HD1080,
         "HD720": sl.RESOLUTION.HD720,
-        "VGA": sl.RESOLUTION.VGA,
+        "VGA": sl.RESOLUTION.VGA
     }
- 
-    init_params = sl.InitParameters()
-    init_params.camera_resolution = res_map[args.resolution]
-    init_params.camera_fps = args.fps
-    init_params.depth_mode = sl.DEPTH_MODE.NEURAL  # good default on 5.x; swap to PERFORMANCE for more headroom
-    init_params.coordinate_units = sl.UNIT.METER
- 
-    zed = sl.Camera()
-    status = zed.open(init_params)
-    if status != sl.ERROR_CODE.SUCCESS:
-        print(f"[FATAL] ZED open failed: {status}")
-        sys.exit(1)
- 
-    cam_info = zed.get_camera_information()
-    print(f"[info] Opened ZED: {cam_info.camera_model}, "
-          f"resolution={cam_info.camera_configuration.resolution.width}x"
-          f"{cam_info.camera_configuration.resolution.height}, "
-          f"fps={cam_info.camera_configuration.fps}")
- 
-    runtime_params = sl.RuntimeParameters()
-    image_zed = sl.Mat()
-    depth_zed = sl.Mat()
- 
-    # --- MediaPipe init ---
-    mp_hands = mp.solutions.hands
-    mp_drawing = mp.solutions.drawing_utils
-    mp_styles = mp.solutions.drawing_styles
- 
-    # static_image_mode False means video capture
-    hands = mp_hands.Hands(
-        static_image_mode=False,
-        max_num_hands=args.max_hands,
-        min_detection_confidence=args.min_detection_confidence,
-        min_tracking_confidence=args.min_tracking_confidence,
+
+    resolution = (
+        res_map[args.resolution]
     )
- 
-    # Landmark points on hand
-    landmarks_of_interest = {
-        0: "WRIST",
-        4: "THUMB_TIP",
-        8: "INDEX_TIP",
-        12: "MIDDLE_TIP",
-        16: "RING_TIP",
-        20: "PINKY_TIP",
-    }
- 
-    frame_count = 0
-    t_window_start = time.time()
-    window_name = "ZED + MediaPipe Hands (test)"
- 
-    print("[info] Starting capture loop. Press 'q' in the display window to quit "
-          "(or Ctrl+C if running headless).")
- 
+
+    mp_hands = (
+        mp.solutions.hands
+    )
+
+    mp_drawing = (
+        mp.solutions.drawing_utils
+    )
+
+    mp_styles = (
+        mp.solutions.drawing_styles
+    )
+
+    workers = {}
+
     try:
+
+        for sn, calib in calibs.items():
+
+            print(
+                f"[info] Opening "
+                f"SN={sn} "
+                f"name={calib.name} ..."
+            )
+
+            worker = CameraWorker(
+                sl,
+                cv2,
+                mp_hands,
+                sn,
+                calib,
+                resolution,
+                args.fps,
+                args.max_hands,
+                args.min_detection_confidence,
+                args.min_tracking_confidence,
+                args.detect_width,
+                args.model_complexity
+            )
+
+            workers[sn] = worker
+
+            worker.start()
+
+    except RuntimeError as e:
+
+        print(
+            f"[FATAL] {e}"
+        )
+
+        for worker in workers.values():
+            worker.stop()
+
+        for worker in workers.values():
+            worker.join(
+                timeout=5.0
+            )
+
+        for worker in workers.values():
+            worker.close()
+
+        sys.exit(1)
+
+    time.sleep(1.0)
+
+    proj_mats = {}
+
+    for sn, calib in calibs.items():
+
+        if calib.fx is None:
+
+            print(
+                "[FATAL] Intrinsics unavailable "
+                f"for SN={sn} "
+                f"({calib.name})."
+            )
+
+            for worker in workers.values():
+                worker.stop()
+
+            for worker in workers.values():
+                worker.join(
+                    timeout=2
+                )
+
+            for worker in workers.values():
+                worker.close()
+
+            sys.exit(1)
+
+        proj_mats[sn] = (
+            build_projection_matrix(
+                calib
+            )
+        )
+
+        print(
+            f"[info] {calib.name}: "
+            f"fx={calib.fx:.2f}, "
+            f"fy={calib.fy:.2f}, "
+            f"cx={calib.cx:.2f}, "
+            f"cy={calib.cy:.2f}"
+        )
+
+    print(
+        "[info] Camera centers in MAIN frame:"
+    )
+
+    for sn, calib in calibs.items():
+
+        print(
+            f"    {calib.name}: "
+            f"{calib.center_main}"
+        )
+
+    print(
+        "[info] MAIN ZED metric XYZ is "
+        "enabled by default."
+    )
+
+    print(
+        "[info] MediaPipe relative Z "
+        "will never be used."
+    )
+
+    frame_count = 0
+
+    window_name = (
+        "Fused multi-view hand tracking"
+    )
+
+    last_good_points = {
+        "Left": [None] * 21,
+        "Right": [None] * 21
+    }
+
+    print(
+        "[info] Starting fused capture loop. "
+        "Press 'q' to quit."
+    )
+
+    try:
+
         while True:
-            if args.max_frames is not None and frame_count >= args.max_frames:
+
+            if (
+                args.max_frames is not None
+                and frame_count >= args.max_frames
+            ):
                 break
- 
-            grab_status = zed.grab(runtime_params)
-            if grab_status != sl.ERROR_CODE.SUCCESS:
-                continue
- 
-            zed.retrieve_image(image_zed, sl.VIEW.LEFT)
-            zed.retrieve_measure(depth_zed, sl.MEASURE.DEPTH)
- 
-            # ZED (BGRA) --> MediaPipe (RGB)
-            frame_bgra = image_zed.get_data()
-            frame_bgr = cv2.cvtColor(frame_bgra, cv2.COLOR_BGRA2BGR)
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            depth_np = depth_zed.get_data()  # float32, meters, same H,W as image
- 
-            results = hands.process(frame_rgb)
- 
-            display_frame = frame_bgr.copy() if not args.no_display else None
- 
-            if results.multi_hand_landmarks:
-                h, w = frame_bgr.shape[:2]
-                for hand_landmarks, handedness in zip(
-                    results.multi_hand_landmarks, results.multi_handedness
+
+            latest = {
+                sn: worker.get_latest()
+                for sn, worker in workers.items()
+            }
+
+            # -----------------------------------------------------
+            # Group detections by physical handedness.
+            # -----------------------------------------------------
+
+            detections_by_label = {
+                "Left": [],
+                "Right": []
+            }
+
+            for sn, data in latest.items():
+
+                results = (
+                    data["results"]
+                )
+
+                if (
+                    results is None
+                    or not results.multi_hand_landmarks
                 ):
-                    # Get Left of Right hand label 
-                    label = handedness.classification[0].label
- 
-                    if display_frame is not None:
-                        mp_drawing.draw_landmarks(
-                            display_frame,
-                            hand_landmarks,
-                            mp_hands.HAND_CONNECTIONS,
-                            mp_styles.get_default_hand_landmarks_style(),
-                            mp_styles.get_default_hand_connections_style(),
+                    continue
+
+                w = data["frame_w"]
+                h = data["frame_h"]
+
+                if (
+                    w is None
+                    or h is None
+                ):
+                    continue
+
+                for (
+                    hand_landmarks,
+                    handedness
+                ) in zip(
+                    results.multi_hand_landmarks,
+                    results.multi_handedness,
+                ):
+
+                    raw_label = (
+                        handedness
+                        .classification[0]
+                        .label
+                    )
+
+                    label = (
+                        correct_handedness(
+                            raw_label,
+                            calibs[sn].name
                         )
- 
-                    # Depth sanity check at landmarks
-                    readings = []
-                    for idx, name in landmarks_of_interest.items():
-                        lm = hand_landmarks.landmark[idx]
-                        px, py = int(lm.x * w), int(lm.y * h)
-                        if 0 <= px < w and 0 <= py < h:
-                            z = depth_np[py, px]
-                            z_str = f"{z:.3f}m" if np.isfinite(z) and z > 0 else "invalid"
+                    )
+
+                    hand_score = float(
+                        handedness
+                        .classification[0]
+                        .score
+                    )
+
+                    detections_by_label[
+                        label
+                    ].append(
+                        {
+                            "sn": sn,
+                            "calib": calibs[sn],
+                            "landmarks": hand_landmarks,
+                            "hand_score": hand_score,
+                            "w": w,
+                            "h": h,
+                            "xyz": data["xyz"],
+                            "capture_ts": data["capture_ts"],
+                            "frame_id": data["frame_id"]
+                        }
+                    )
+
+            fused_hands = {}
+
+            for (
+                label,
+                detections
+            ) in detections_by_label.items():
+
+                if not detections:
+                    continue
+
+                # -------------------------------------------------
+                # Synchronize by capture timestamp.
+                # -------------------------------------------------
+
+                newest_ts = max(
+                    d["capture_ts"]
+                    for d in detections
+                )
+
+                sync_limit = (
+                    args.max_sync_skew_ms
+                    / 1000.0
+                )
+
+                synced = [
+                    d
+                    for d in detections
+                    if (
+                        newest_ts
+                        - d["capture_ts"]
+                        <= sync_limit
+                    )
+                ]
+
+                if not synced:
+                    continue
+
+                main_detections = [
+                    d
+                    for d in synced
+                    if d["calib"].name == "main"
+                ]
+
+                mono_detections = [
+                    d
+                    for d in synced
+                    if d["calib"].name != "main"
+                ]
+
+                # -------------------------------------------------
+                # Highest-confidence MAIN detection is primary.
+                # -------------------------------------------------
+
+                main_detection = None
+
+                if main_detections:
+
+                    main_detection = max(
+                        main_detections,
+                        key=lambda d:
+                            d["hand_score"]
+                    )
+
+                points3d = [
+                    None
+                ] * 21
+
+                landmark_sources = [
+                    "unavailable"
+                ] * 21
+
+                landmark_errors = {}
+
+                correction_distances = {}
+
+                mono_view_counts = {}
+
+                # -------------------------------------------------
+                # Process each landmark independently.
+                # -------------------------------------------------
+
+                for landmark_index in range(21):
+
+                    main_point = None
+
+                    # =================================================
+                    # STEP 1
+                    #
+                    # MAIN MediaPipe pixel
+                    #        ↓
+                    # ZED XYZ measurement
+                    #
+                    # This is PRIMARY.
+                    # =================================================
+
+                    if main_detection is not None:
+
+                        main_lm = (
+                            main_detection[
+                                "landmarks"
+                            ]
+                            .landmark[
+                                landmark_index
+                            ]
+                        )
+
+                        main_point = (
+                            get_zed_xyz_point(
+                                main_lm,
+                                main_detection
+                            )
+                        )
+
+                    # =================================================
+                    # STEP 2
+                    #
+                    # Gather mono observations.
+                    #
+                    # They provide rays only.
+                    # MediaPipe Z is ignored.
+                    # =================================================
+
+                    mono_observations = []
+
+                    for d in mono_detections:
+
+                        lm = (
+                            d["landmarks"]
+                            .landmark[
+                                landmark_index
+                            ]
+                        )
+
+                        px = (
+                            float(lm.x)
+                            * float(d["w"])
+                        )
+
+                        py = (
+                            float(lm.y)
+                            * float(d["h"])
+                        )
+
+                        quality = (
+                            observation_quality(
+                                lm,
+                                px,
+                                py,
+                                d["w"],
+                                d["h"]
+                            )
+                        )
+
+                        if quality <= 0.0:
+                            continue
+
+                        mono_observations.append(
+                            {
+                                "sn": d["sn"],
+                                "calib": d["calib"],
+                                "px": px,
+                                "py": py,
+                                "quality": quality,
+                                "hand_score": d["hand_score"],
+                                "capture_ts": d["capture_ts"],
+                                "frame_id": d["frame_id"]
+                            }
+                        )
+
+                    # =================================================
+                    # STEP 3
+                    #
+                    # ZED XYZ exists.
+                    #
+                    # ZED remains the primary source.
+                    #
+                    # Mono views may refine it.
+                    # =================================================
+
+                    if main_point is not None:
+
+                        if mono_observations:
+
+                            (
+                                refined_point,
+                                correction,
+                                n_mono
+                            ) = (
+                                refine_point_with_mono_views(
+                                    main_point,
+                                    mono_observations,
+                                    blend=args.mono_refine_blend
+                                )
+                            )
+
+                            points3d[
+                                landmark_index
+                            ] = refined_point
+
+                            landmark_sources[
+                                landmark_index
+                            ] = (
+                                "zed_xyz+mono_refined"
+                            )
+
+                            correction_distances[
+                                landmark_index
+                            ] = correction
+
+                            mono_view_counts[
+                                landmark_index
+                            ] = n_mono
+
                         else:
-                            z_str = "out of bounds"
-                        readings.append(f"{name}={z_str}")
- 
-                    if frame_count % 30 == 0:
-                        print(f"[{label} hand] " + ", ".join(readings))
- 
-            frame_count += 1
+
+                            points3d[
+                                landmark_index
+                            ] = main_point
+
+                            landmark_sources[
+                                landmark_index
+                            ] = "zed_xyz"
+
+                        last_good_points[
+                            label
+                        ][
+                            landmark_index
+                        ] = (
+                            points3d[
+                                landmark_index
+                            ].copy()
+                        )
+
+                        continue
+
+                    # =================================================
+                    # STEP 4
+                    #
+                    # ZED XYZ unavailable.
+                    #
+                    # Try multi-camera triangulation.
+                    # =================================================
+
+                    all_observations = []
+
+                    for d in synced:
+
+                        lm = (
+                            d["landmarks"]
+                            .landmark[
+                                landmark_index
+                            ]
+                        )
+
+                        px = (
+                            float(lm.x)
+                            * float(d["w"])
+                        )
+
+                        py = (
+                            float(lm.y)
+                            * float(d["h"])
+                        )
+
+                        quality = (
+                            observation_quality(
+                                lm,
+                                px,
+                                py,
+                                d["w"],
+                                d["h"]
+                            )
+                        )
+
+                        if quality <= 0.0:
+                            continue
+
+                        all_observations.append(
+                            (
+                                proj_mats[
+                                    d["sn"]
+                                ],
+                                px,
+                                py,
+                                d["sn"]
+                            )
+                        )
+
+                    if len(
+                        all_observations
+                    ) >= 2:
+
+                        (
+                            point,
+                            errors,
+                            status
+                        ) = fuse_landmark(
+                            all_observations,
+                            args.min_triangulation_angle_deg,
+                            args.reproj_error_threshold_px
+                        )
+
+                        if point is not None:
+
+                            points3d[
+                                landmark_index
+                            ] = point
+
+                            landmark_sources[
+                                landmark_index
+                            ] = (
+                                "multi_view_triangulated"
+                            )
+
+                            landmark_errors[
+                                landmark_index
+                            ] = errors
+
+                            last_good_points[
+                                label
+                            ][
+                                landmark_index
+                            ] = point.copy()
+
+                            continue
+
+                    # =================================================
+                    # STEP 5
+                    #
+                    # No metric solution.
+                    #
+                    # Do NOT use MediaPipe relative Z.
+                    # =================================================
+
+                    landmark_sources[
+                        landmark_index
+                    ] = "unavailable"
+
+                fused_hands[
+                    label
+                ] = {
+                    "points3d": points3d,
+                    "source": (
+                        "zed_xyz_primary"
+                        if main_detection is not None
+                        else "triangulation_or_unavailable"
+                    ),
+                    "n_views": len(synced),
+                    "landmark_sources": landmark_sources,
+                    "reproj_errs": landmark_errors,
+                    "correction_distances": correction_distances,
+                    "mono_view_counts": mono_view_counts
+                }
+
+            # ---------------------------------------------------------
+            # Output
+            # ---------------------------------------------------------
+
+            message_payload = {
+                "hands": {
+                    label: build_finger_dict(
+                        data["points3d"],
+                        data["landmark_sources"]
+                    )
+                    for (
+                        label,
+                        data
+                    ) in fused_hands.items()
+                }
+            }
+
+            send_message(
+                message_payload
+            )
+
+            print(
+                message_payload
+            )
+
+            # ---------------------------------------------------------
+            # Diagnostics
+            # ---------------------------------------------------------
+
             if frame_count % 30 == 0:
-                elapsed = time.time() - t_window_start
-                fps = 30 / elapsed if elapsed > 0 else 0.0
-                print(f"[perf] ~{fps:.1f} fps over last 30 frames")
-                t_window_start = time.time()
- 
-            # Quit with q
-            if display_frame is not None:
-                cv2.imshow(window_name, display_frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
- 
+
+                for (
+                    label,
+                    data
+                ) in fused_hands.items():
+
+                    valid = sum(
+                        p is not None
+                        for p in data[
+                            "points3d"
+                        ]
+                    )
+
+                    print(
+                        f"[frame {frame_count}] "
+                        f"{label}: "
+                        f"{valid}/21 metric 3D"
+                    )
+
+                    source_counts = {}
+
+                    for source in data[
+                        "landmark_sources"
+                    ]:
+
+                        source_counts[
+                            source
+                        ] = (
+                            source_counts.get(
+                                source,
+                                0
+                            ) + 1
+                        )
+
+                    print(
+                        f"    sources="
+                        f"{source_counts}"
+                    )
+
+                    reproj_errs = (
+                        data.get(
+                            "reproj_errs"
+                        )
+                        or {}
+                    )
+
+                    if isinstance(
+                        reproj_errs,
+                        dict
+                    ):
+
+                        for (
+                            idx,
+                            errors
+                        ) in reproj_errs.items():
+
+                            if not errors:
+                                continue
+
+                            error_text = ", ".join(
+                                f"SN={sn}:{err:.1f}px"
+                                for (
+                                    sn,
+                                    err
+                                ) in errors
+                            )
+
+                            if max(
+                                err
+                                for (
+                                    _,
+                                    err
+                                ) in errors
+                            ) > (
+                                args.reproj_error_warn_px
+                            ):
+
+                                print(
+                                    f"      "
+                                    f"{LANDMARK_NAMES[idx]}: "
+                                    f"{error_text}"
+                                )
+
+            # ---------------------------------------------------------
+            # Display MAIN camera.
+            # ---------------------------------------------------------
+
+            if not args.no_display:
+
+                main_frame_data = (
+                    workers[
+                        main_sn
+                    ].get_latest_frame()
+                )
+
+                main_result_data = (
+                    latest.get(
+                        main_sn
+                    )
+                )
+
+                if (
+                    main_frame_data
+                    and main_frame_data[
+                        "frame_bgr"
+                    ] is not None
+                ):
+
+                    display = (
+                        main_frame_data[
+                            "frame_bgr"
+                        ].copy()
+                    )
+
+                    results = (
+                        main_result_data[
+                            "results"
+                        ]
+                    )
+
+                    if (
+                        results
+                        and results.multi_hand_landmarks
+                    ):
+
+                        for hl in (
+                            results.multi_hand_landmarks
+                        ):
+
+                            mp_drawing.draw_landmarks(
+                                display,
+                                hl,
+                                mp_hands.HAND_CONNECTIONS,
+                                mp_styles.get_default_hand_landmarks_style(),
+                                mp_styles.get_default_hand_connections_style()
+                            )
+
+                    y = 30
+
+                    for (
+                        label,
+                        data
+                    ) in fused_hands.items():
+
+                        valid = sum(
+                            p is not None
+                            for p in data[
+                                "points3d"
+                            ]
+                        )
+
+                        cv2.putText(
+                            display,
+                            (
+                                f"{label}: "
+                                f"{valid}/21 3D"
+                            ),
+                            (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            (0, 255, 0),
+                            2
+                        )
+
+                        y += 25
+
+                    cv2.imshow(
+                        window_name,
+                        display
+                    )
+
+                    if (
+                        cv2.waitKey(1)
+                        & 0xFF
+                    ) == ord("q"):
+
+                        break
+
+            frame_count += 1
+
     except KeyboardInterrupt:
-        print("\n[info] Interrupted by user.")
- 
+
+        print(
+            "\n[info] Interrupted by user."
+        )
+
     finally:
-        hands.close()
-        zed.close()
+
+        for worker in workers.values():
+            worker.stop()
+
+        for worker in workers.values():
+            worker._tracking_thread.join(
+                timeout=3.0
+            )
+
+        for worker in workers.values():
+            worker._capture_thread.join(
+                timeout=5.0
+            )
+
+        for worker in workers.values():
+            worker.close()
+
         if not args.no_display:
             cv2.destroyAllWindows()
-        print(f"[info] Done. Processed {frame_count} frames.")
- 
- 
+
+        print(
+            f"[info] Done. "
+            f"Processed "
+            f"{frame_count} "
+            f"main-loop iterations."
+        )
+
+
 if __name__ == "__main__":
     main()
- 
-
