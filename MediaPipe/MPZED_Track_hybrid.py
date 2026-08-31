@@ -18,6 +18,7 @@ ZED X Mini + MediaPipe Hands
 """
 
 import argparse
+import socket
 import json
 import threading
 import time
@@ -28,6 +29,9 @@ import pyzed.sl as sl
 
 
 DEFAULT_CALIB = ("/home/user/Documents/Ultraleap_ChArUco_Python_Calibration/camera_calibration.json")
+TARGET_IP = "10.10.1.135"
+TARGET_PORT =  7778
+udp_socket = None
 
 # remove later if not tracking point
 FINGER_GROUPS = {
@@ -91,10 +95,8 @@ def load_calibration(path):
     return int(cam["serial"]), cam
 
 
+# Best-effort extraction of fx/fy/cx/cy.
 def try_json_intrinsics(cam):
-    """
-    Best-effort extraction of fx/fy/cx/cy.
-    """
 
     def from_flat(d):
         if all(
@@ -105,7 +107,7 @@ def try_json_intrinsics(cam):
                 "fx": float(d["fx"]),
                 "fy": float(d["fy"]),
                 "cx": float(d["cx"]),
-                "cy": float(d["cy"]),
+                "cy": float(d["cy"])
             }
 
         return None
@@ -196,7 +198,7 @@ def zed_to_unreal(zed_xyz):
         [
             zed_xyz[2],
             zed_xyz[0],
-            -zed_xyz[1],
+            -zed_xyz[1]
         ],
         dtype=np.float32
     )
@@ -260,11 +262,11 @@ class CaptureThread(threading.Thread):
             [
                 [
                     float(p[0]),
-                    float(p[1]),
+                    float(p[1])
                 ]
                 for p in body.bounding_box_2d
             ],
-            dtype=np.float32,
+            dtype=np.float32
         )
 
         if pts.size == 0:
@@ -416,12 +418,8 @@ class CaptureThread(threading.Thread):
                 n = 0
                 t0 = time.monotonic()
 
-
+# Makes MediaPipe Tasks results compatible with the legacy result interface used by the program.
 class _TasksResultShim:
-    """
-    Makes MediaPipe Tasks results compatible with
-    the legacy result interface used by the program.
-    """
 
     def __init__(self, task_result):
 
@@ -463,12 +461,8 @@ class _TasksResultShim:
             self.multi_handedness.append(h)
 
 
+# MediaPipe tracking thread. Only newest frame processed.
 class TrackingThread(threading.Thread):
-    """
-    MediaPipe tracking thread.
-
-    Only the newest frame is processed.
-    """
 
     def __init__(
         self,
@@ -604,10 +598,7 @@ class TrackingThread(threading.Thread):
 
                     inp = cv2.resize(
                         inp,
-                        (
-                            self.width,
-                            max(1, int(roi_h * scale))
-                        ),
+                        (self.width, max(1, int(roi_h * scale))),
                         interpolation=cv2.INTER_AREA
                     )
 
@@ -649,11 +640,10 @@ class TrackingThread(threading.Thread):
                 self.landmarker.close()
 
 
+# Read ZED depth at a pixel.
+# Uses a 5x5 median fallback when the exact pixel is invalid.
 def depth_at(depth, x, y):
-    """
-    Read ZED depth at a pixel.
-    Uses a 5x5 median fallback when the exact pixel is invalid.
-    """
+
     h, w = depth.shape[:2]
 
     x = int(round(x))
@@ -688,12 +678,8 @@ def depth_at(depth, x, y):
 
     return float(np.median(values))
 
-
+# Map MediaPipe normalized image coordinates back to native ZED pixels.
 def landmark_to_original_pixel(lm,result):
-    """
-    Map MediaPipe normalized image coordinates
-    back to native ZED pixels.
-    """
 
     x0, y0, x1, y1 = result["roi"]
 
@@ -705,25 +691,9 @@ def landmark_to_original_pixel(lm,result):
 
     return x, y
 
-
-def reconstruct_hand_3d(
-    hand,
-    result,
-    depth,
-    intr,
-    hand_scale
-):
-    """
-    Reconstruct a hand using:
-
-        absolute position:
-            ZED wrist depth
-
-        relative shape:
-            MediaPipe's 21 landmarks
-
-    Returns 21 points in ZED camera coordinates, in meters.
-    """
+# Reconstruct a hand using ZED wrist depth as absolute position with MP 21 landmarks relative
+# Returns landmark in Zed Cam meter coordinates
+def reconstruct_hand_3d(hand, result, depth, intr, hand_scale):
 
     if hand is None:
         return None
@@ -803,14 +773,9 @@ def reconstruct_hand_3d(
 
     return reconstructed
 
-
+# Convert reconstructed ZED points into Unreal coordinates and group
+# Outputs in centimeters.
 def points_to_finger_dict(points):
-    """
-    Convert reconstructed ZED points into Unreal coordinates
-    and group them into the existing payload format.
-
-    Output units: centimeters.
-    """
 
     if points is None:
         return None
@@ -828,26 +793,14 @@ def points_to_finger_dict(points):
 
             ue = zed_to_unreal(points[idx])
 
-            finger_points.append(
-                [
-                    float(ue[0] * 100.0),
-                    float(ue[1] * 100.0),
-                    float(ue[2] * 100.0)
-                ]
-            )
+            finger_points.append([float(ue[0] * 100.0), float(ue[1] * 100.0), float(ue[2] * 100.0)])
 
         out[finger] = finger_points
 
     return out
 
 
-def build_finger_dict(
-    hand,
-    result,
-    depth,
-    intr,
-    hand_scale
-):
+def build_finger_dict(hand, result, depth, intr, hand_scale):
     """
     Build one complete hand.
     Returns None if hand can't be reconstructed.
@@ -865,22 +818,20 @@ def build_finger_dict(
 
 
 def send_message(payload: dict):
-    """
-    Replace this with Unreal message transport.
-    UDP / OSC / WebSocket / TCP can be implemented here.
-    """
-    pass
+    
+    try:
+        payload_string = json.dumps(payload)
+        payload_bytes = payload_string.encode('utf-8')
+        
+        udp_socket.sendto(payload_bytes, (TARGET_IP, TARGET_PORT))
+        #print (payload_string)
+    except Exception:
+        pass
 
 
-def output_landmarks(
-    results,
-    depth,
-    result,
-    intr,
-    hand_scale
-):
+def output_landmarks(results, depth, result, intr, hand_scale):
     """
-    Output ONLY successfully tracked/reconstructed hands.
+    Outputs ONLY successfully tracked/reconstructed hands.
 
     Good tracking:
         {'hands': {
@@ -895,18 +846,12 @@ def output_landmarks(
         nothing is printed or sent.
     """
 
-    if (
-        results is None
-        or not results.multi_hand_landmarks
-    ):
+    if (results is None or not results.multi_hand_landmarks):
         return
 
     hands_payload = {}
 
-    handedness = (
-        results.multi_handedness
-        or []
-    )
+    handedness = (results.multi_handedness or [])
 
     for i, hand in enumerate( results.multi_hand_landmarks):
 
@@ -935,7 +880,7 @@ def output_landmarks(
         # A detected hand with invalid ZED wrist depth should NOT
         # become: "Left": None
         #
-        # Omit from outgoing messages
+        # Omitted from outgoing messages
         # --------------------------------------------------------
 
         if hand_payload is None:
@@ -946,15 +891,19 @@ def output_landmarks(
     if not hands_payload:
         return
 
+    global udp_socket
+    if udp_socket is None:
+        print("established socket")
+        udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        
     message_payload = {"hands": hands_payload}
-    print(message_payload)
+    #print(message_payload)
     send_message(message_payload)
 
 
+# Draw MediaPipe 2D skeleton.
 def draw_results(display, result):
-    """
-    Draw MediaPipe 2D skeleton.
-    """
+    
     results = result["results"]
 
     if (results is None or not results.multi_hand_landmarks):
@@ -966,11 +915,9 @@ def draw_results(display, result):
     roi_h = result["roi_height"]
 
     for hand in (results.multi_hand_landmarks):
-
         points = []
 
         for lm in hand.landmark:
-
             x = int(x0 + lm.x * roi_w)
             y = int(y0 + lm.y * roi_h)
 
@@ -979,30 +926,12 @@ def draw_results(display, result):
         for a, b in (mp.solutions.hands.HAND_CONNECTIONS):
 
             if (0 <= a < len(points) and 0 <= b < len(points)):
-                cv2.line(
-                    display,
-                    points[a],
-                    points[b],
-                    (0, 255, 0),
-                    2
-                )
+                cv2.line(display, points[a], points[b], (0, 255, 0), 2)
 
         for x, y in points:
-            cv2.circle(
-                display,
-                (x, y),
-                3,
-                (0, 255, 0),
-                -1
-            )
+            cv2.circle(display, (x, y), 3, (0, 255, 0), -1)
 
-    cv2.rectangle(
-        display,
-        (int(x0), int(y0)),
-        (int(x1), int(y1)),
-        (255, 0, 0),
-        2
-    )
+    cv2.rectangle(display, (int(x0), int(y0)), (int(x1), int(y1)), (255, 0, 0), 2)
 
 
 def main():
@@ -1075,11 +1004,7 @@ def main():
         f"{a.engine}"
     )
 
-    print(
-        "[info] Hand reconstruction: "
-        "ZED wrist depth + MediaPipe "
-        "relative hand geometry"
-    )
+    print("[info] Hand reconstruction: ZED wrist depth + MediaPipe relative hand geometry")
 
     print(
         "[info] Hand scale: "
@@ -1088,6 +1013,9 @@ def main():
 
     print("[info] Unreal mapping: X=ZED.Z, Y=ZED.X, Z=-ZED.Y")
 
+    # fx and fy are focal length on the x and y axis
+    # cy and cy are principal point, approximate position of camera's 
+    # optical axisintersecting the image plane
     intr = try_json_intrinsics(cam_info)
 
     if intr is not None:
@@ -1126,10 +1054,7 @@ def main():
         status = camera.enable_body_tracking(body_params)
 
         if (status != sl.ERROR_CODE.SUCCESS):
-            raise RuntimeError(
-                "ZED body tracking enable failed: "
-                f"{status}"
-            )
+            raise RuntimeError(f"ZED body tracking enable failed: {status}")
 
     state = State()
 
@@ -1151,6 +1076,7 @@ def main():
     tracking.start()
 
     last_print = 0.0
+    last_sent_frame_id = -1
 
     try:
 
@@ -1181,26 +1107,31 @@ def main():
                         draw_results(display, result)
 
                         now = time.monotonic()
+                        frame_id = result["frame_id"]
 
-                        if ( now - last_print >= 1.0):
+                        if (frame_id == last_sent_frame_id):
+                            time.sleep(0.001)
+                            continue
+                            
+                        last_sent_frame_id = frame_id
+                        
+                        output_landmarks(
+                            mp_results,
+                            result["depth"],
+                            result,
+                            intr,
+                            a.hand_scale
+                        )
 
-                            output_landmarks(
-                                mp_results,
-                                result["depth"],
-                                result,
-                                intr,
-                                a.hand_scale
-                            )
-
+                        if (now - last_print >= 1.0):
                             last_print = now
+                            
+                time.sleep(0.001)
 
                 # FPS Info
-                """cv2.putText(
+                cv2.putText(
                     display,
-                    (
-                        f"Capture: "
-                        f"{state.capture_fps:.1f} FPS"
-                    ),
+                    f"Capture: {state.capture_fps:.1f} FPS",
                     (15, 30),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
@@ -1210,10 +1141,7 @@ def main():
 
                 cv2.putText(
                     display,
-                    (
-                        f"MediaPipe: "
-                        f"{state.tracking_fps:.1f} FPS"
-                    ),
+                    f"MediaPipe: {state.tracking_fps:.1f} FPS",
                     (15, 58),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.65,
@@ -1225,17 +1153,14 @@ def main():
 
                     cv2.putText(
                         display,
-                        (
-                            f"Body ROI: "
-                            f"{state.roi_fps:.1f} FPS"
-                        ),
+                        f"Body ROI: {state.roi_fps:.1f} FPS",
                         (15, 86),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.65,
                         (0, 255, 0),
-                        2,
+                        2
                     )
-                """
+                
                 cv2.imshow("ZED X Mini + MediaPipe Hands", display)
 
                 if (cv2.waitKey(1) & 0xFF == ord("q")):
@@ -1248,28 +1173,25 @@ def main():
 
                     now = time.monotonic()
 
+                    frame_id = result["frame_id"]
+
+                    if (frame_id == last_sent_frame_id):
+                        time.sleep(0.001)
+                        continue
+                            
+                    last_sent_frame_id = frame_id
+                        
+                    output_landmarks(
+                        mp_results,
+                        result["depth"],
+                        result,
+                        intr,
+                        a.hand_scale
+                    )
+
                     if (now - last_print >= 1.0):
-
-                        output_landmarks(
-                            mp_results,
-                            result["depth"],
-                            result,
-                            intr,
-                            a.hand_scale
-                        )
-
-                        print(
-                            f"Capture: "
-                            f"{state.capture_fps:.1f} FPS"
-                        )
-
-                        print(
-                            f"MediaPipe: "
-                            f"{state.tracking_fps:.1f} FPS"
-                        )
-
                         last_print = now
-
+                        
                 time.sleep(0.001)
 
     except KeyboardInterrupt:
@@ -1289,6 +1211,9 @@ def main():
                 pass
 
         camera.close()
+        
+        if udp_socket is not None:
+            udp_socket.close()
 
         if not a.no_display:
             cv2.destroyAllWindows()
